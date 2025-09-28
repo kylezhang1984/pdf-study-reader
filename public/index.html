@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>PDF 学习阅读器</title>
+  <link rel="icon" href="data:,">
+  <style>
+    :root, html, body { height:100%; }
+    :root { --panelW: 420px; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; overflow: hidden; }
+    header#topbar { display:flex; gap:10px; align-items:center; padding:10px; border-bottom:1px solid #e5e5e5; }
+    button,.btn { padding:6px 12px; border:1px solid #e5e5e5; border-radius:8px; background:#fff; cursor:pointer; }
+    #app { height: 100%; display: flex; flex-direction: column; }
+    #workbench { display: flex; flex: 1; overflow: hidden; }
+
+    #viewerWrap { flex:1 1 auto; min-width:0; position:relative; }
+    #viewerHost { width:100%; height:100%; border:0; background:#fff; }
+
+    #side-panel{
+      flex:0 0 var(--panelW); width:var(--panelW); max-width:48vw;
+      height:100vh; overflow:auto;
+      border-left:1px solid #eee; background:#fff;
+      position:relative; z-index:3;
+    }
+
+    /* 全屏时同时显示左侧 PDF 与右侧面板 */
+    body.immersive #viewerHost{
+      position: fixed !important;
+      top: 0; left: 0; bottom: 0;
+      /* 显式用 calc 计算宽度，避免浏览器在 right + width:auto 时保留旧宽度 */
+      width: calc(100vw - var(--panelW)) !important;
+      height: 100vh !important;
+      z-index: 2147483000 !important;
+      background: #000;
+      display:block !important;
+      /* 强制触发重排/重绘，防止进入全屏后残留旧布局 */
+      transform: translateZ(0);
+    }
+    body.immersive #side-panel{
+      position: fixed !important;
+      top: 0; right: 0; height: 100vh;
+      width: var(--panelW) !important;
+      z-index: 2147483002 !important;          /* 高于 viewerHost */
+      display: block !important;
+      visibility: visible !important;
+      opacity: 1 !important;
+      background:#fff;
+    }
+
+    /* 浮动设置按钮，仅沉浸/全屏时显示，悬浮于右上角，z-index 高于 viewerHost 低于侧栏 */
+    #cfgFloat {
+      position: fixed;
+      top: 24px;
+      right: 440px;
+      z-index: 2147483001;
+      display: none;
+      background: #fff;
+      border-radius: 50%;
+      width: 44px;
+      height: 44px;
+      font-size: 22px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.12);
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      line-height: 44px;
+    }
+    body.immersive #cfgFloat {
+      display: flex;
+    }
+
+    /* 沉浸模式下 topbar 不要阻挡点击 */
+    body.immersive header#topbar {
+      pointer-events: none;
+    }
+
+    /* 面板内部微样式 */
+    #side-panel .blk{ padding:12px; }
+    #side-panel .row{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    #side-panel textarea{ width:100%; box-sizing:border-box; }
+    #vocabList .item{ text-align:left; width:100%; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <input type="file" id="file" accept="application/pdf" />
+      <button id="openSample" class="btn">打开示例</button>
+      <button id="btnFullscreen" type="button" class="btn">全屏</button>
+      <button id="btnCfg" class="btn" title="本地翻译设置">⚙️</button>
+      <div id="status" style="margin-left:auto;color:#666">未加载</div>
+    </header>
+    <div id="workbench">
+      <div id="viewerWrap">
+        <iframe id="viewerHost"
+                src="pdfjs/web/viewer.html"
+                title="PDF viewer"
+                allow="fullscreen"
+                style="width:100%;height:100%;border:0;background:#fff;"></iframe>
+      </div>
+      <aside id="side-panel">
+        <section class="blk">
+          <h3>Selected Text</h3>
+          <textarea id="selectedText" rows="6" placeholder="选中 PDF 文本后这里显示"></textarea>
+          <div class="row">
+            <button id="btnTranslate">Translate</button>
+            <button id="btnSpeak">Speak</button>
+            <button id="btnSave">Save</button>
+            <button id="btnClear">Clear</button>
+          </div>
+        </section>
+        <section class="blk">
+          <h3>Translation</h3>
+          <textarea id="translation" rows="8" placeholder="翻译结果"></textarea>
+        </section>
+        <section class="blk">
+          <h3>生词本（本地）</h3>
+          <div class="row">
+            <button id="btnExport">导出</button>
+            <button id="btnImport">导入</button>
+            <input id="importFile" type="file" accept="application/json" style="display:none">
+          </div>
+          <div id="vocabList"></div>
+        </section>
+      </aside>
+      <button id="cfgFloat" class="btn" title="本地翻译设置">⚙️</button>
+    </div>
+  </div>
+
+  <script>
+    // File loading & PDF text selection listener
+    (() => {
+      const fileInp = document.getElementById('file');
+      const openSampleBtn = document.getElementById('openSample');
+      const statusEl = document.getElementById('status');
+      let lastBlob = null;
+
+      function loadPdf(url, label=''){
+        document.getElementById('viewerHost').src =
+          `/pdfjs/web/viewer.html?file=${encodeURIComponent(url)}#zoom=page-width`;
+        statusEl.textContent = label ? `Loaded: ${label}` : 'Loaded';
+      }
+
+      fileInp.addEventListener('change', e => {
+        const f = e.target.files?.[0];
+        if (!f) return;
+        if (lastBlob) URL.revokeObjectURL(lastBlob);
+        const url = URL.createObjectURL(f);
+        lastBlob = url;
+        loadPdf(url, f.name);
+      });
+      openSampleBtn.addEventListener('click', () => loadPdf('/sample.pdf', 'sample.pdf'));
+    })();
+  </script>
+
+  <script>
+  document.addEventListener('DOMContentLoaded', () => {
+  // 只保留唯一 side-panel（防止历史遗留重复注入）
+  const panels = Array.from(document.querySelectorAll('aside#side-panel'));
+  if (panels.length > 1) panels.slice(1).forEach(p => p.remove());
+
+  const $ = s => document.querySelector(s);
+  const el = {
+    sel: $('#selectedText'),
+    tran: $('#translation'),
+    save: $('#btnSave'),
+    speak: $('#btnSpeak'),
+    trans: $('#btnTranslate'),
+    clear: $('#btnClear'),
+    vlist: $('#vocabList'),
+    exp: $('#btnExport'),
+    imp: $('#btnImport'),
+    impFile: $('#importFile'),
+  };
+
+  // 若项目已定义 appActions（你们自己的实现），则直接用
+  const A = (window.appActions || {});
+
+  // ---- Translate（兜底：什么都没有时用 MyMemory 免费接口） ----
+  if (el.trans && !A.translate) {
+    el.trans.addEventListener('click', async () => {
+      const text = (el.sel?.value || '').trim();
+      if (!text) return;
+      try {
+        const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=en|zh-CN`;
+        const r = await fetch(url); const j = await r.json();
+        el.tran.value = j?.responseData?.translatedText || '';
+      } catch(e) { console.warn('[translate:fallback]', e); }
+    });
+  }
+
+  // ---- Speak（兜底：Web Speech） ----
+  if (el.speak && !A.speak) {
+    el.speak.addEventListener('click', () => {
+      const t = (el.sel?.value || '').trim(); if (!t) return;
+      const u = new SpeechSynthesisUtterance(t); u.lang = 'en-US';
+      speechSynthesis.cancel(); speechSynthesis.speak(u);
+    });
+  }
+
+  // ---- Save（兜底：localStorage 生词本，带查询计数） ----
+  function renderVocab(){
+    if (!el.vlist) return;
+    const items = JSON.parse(localStorage.getItem('vocab') || '[]');
+    el.vlist.innerHTML = items.map((it,i)=>`
+      <div class="item" data-i="${i}" style="padding:8px;border-bottom:1px solid #eee;">
+        <div><b>${it.term}</b> <small>(${it.count})</small></div>
+        <div style="color:#555">${it.translation || ''}</div>
+      </div>
+    `).join('');
+  }
+  if (el.save && !A.save) {
+    el.save.addEventListener('click', () => {
+      const term = (el.sel?.value || '').trim(); if (!term) return;
+      const translation = (el.tran?.value || '').trim();
+      const arr = JSON.parse(localStorage.getItem('vocab') || '[]');
+      const hit = arr.find(x => x.term === term);
+      if (hit) { hit.count = (hit.count||0)+1; hit.translation = translation || hit.translation; }
+      else { arr.push({ term, translation, count:1 }); }
+      localStorage.setItem('vocab', JSON.stringify(arr));
+      renderVocab();
+    });
+    renderVocab();
+  }
+
+  // ---- Clear（兜底） ----
+  if (el.clear && !A.clear) {
+    el.clear.addEventListener('click', () => {
+      if (el.sel) el.sel.value = '';
+      if (el.tran) el.tran.value = '';
+    });
+  }
+
+  // ---- Import / Export（兜底） ----
+  if (el.exp) {
+    el.exp.addEventListener('click', () => {
+      const data = localStorage.getItem('vocab') || '[]';
+      const blob = new Blob([data], {type:'application/json'});
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'vocab.json';
+      a.click();
+    });
+  }
+  if (el.imp && el.impFile) {
+    el.imp.addEventListener('click', ()=> el.impFile.click());
+    el.impFile.addEventListener('change', async () => {
+      const f = el.impFile.files?.[0]; if (!f) return;
+      const text = await f.text();
+      try { JSON.parse(text); localStorage.setItem('vocab', text); renderVocab(); }
+      catch { console.warn('[vocab:import] invalid JSON'); }
+    });
+  }
+});
+  </script>
+
+<script>
+// 设置弹窗控制器 & 浮动按钮
+document.addEventListener('DOMContentLoaded', function setupLocalTranslator(){
+  // 1) load / persist cfg
+  const load = () => {
+    try { return JSON.parse(localStorage.getItem('localCfg')||'{}'); } catch { return {}; }
+  };
+  const save = (cfg) => localStorage.setItem('localCfg', JSON.stringify(cfg||{}));
+  window.localCfg = Object.assign({preferLocal:false, autoTranslate:false, autoSpeak:false}, load());
+
+  // 2) dialog wiring
+  function grab(){
+    return {
+      btn: document.getElementById('btnCfg'),
+      btnFloat: document.getElementById('cfgFloat'),
+      mask: document.getElementById('cfgMask'),
+      ep: document.getElementById('cfgEndpoint'),
+      md: document.getElementById('cfgModel'),
+      prefer: document.getElementById('cfgPreferLocal'),
+      at: document.getElementById('cfgAutoTrans'),
+      as: document.getElementById('cfgAutoSpeak'),
+      msg: document.getElementById('cfgMsg'),
+    };
+  }
+  function fill(){
+    const g = grab();
+    const c = window.localCfg || {};
+    if (g.ep) g.ep.value = c.endpoint || '';
+    if (g.md) g.md.value = c.model || '';
+    if (g.prefer) g.prefer.checked = !!c.preferLocal;
+    if (g.at) g.at.checked = !!c.autoTranslate;
+    if (g.as) g.as.checked = !!c.autoSpeak;
+    if (g.msg) g.msg.textContent = '';
+  }
+  function show(){ fill(); const g = grab(); if (g.mask) g.mask.style.display = 'flex'; }
+  function hide(){ const g = grab(); if (g.mask) g.mask.style.display = 'none'; }
+  const g0 = grab();
+  g0.btn && g0.btn.addEventListener('click', show);
+  g0.btnFloat && g0.btnFloat.addEventListener('click', show);
+  document.getElementById('cfgClose')?.addEventListener('click', hide);
+  document.getElementById('cfgSave')?.addEventListener('click', ()=>{
+    const g = grab();
+    window.localCfg = {
+      endpoint: (g.ep?.value || '').trim(),
+      model: (g.md?.value || '').trim(),
+      preferLocal: !!g.prefer?.checked,
+      autoTranslate: !!g.at?.checked,
+      autoSpeak: !!g.as?.checked,
+    };
+    save(window.localCfg);
+    if (g.msg) g.msg.textContent = '已保存';
+    setTimeout(hide, 500);
+  });
+  document.getElementById('cfgTest')?.addEventListener('click', async ()=>{
+    const g = grab();
+    if (g.msg) g.msg.textContent = '测试中...';
+    try {
+      const ok = await localCall('Hello');
+      if (g.msg) g.msg.textContent = ok ? '本地接口可用' : '本地接口不可用';
+    } catch(e){ if (g.msg) g.msg.textContent = '本地接口不可用'; }
+  });
+
+  // 3) local-first translate
+  async function localCall(text){
+    const {endpoint, model} = window.localCfg||{};
+    if (!endpoint || !model) return null;
+    try {
+      const r = await fetch(endpoint.replace(/\/$/,'') + '/chat/completions', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          model,
+          messages:[{role:'user', content:text}],
+          temperature: 0.2,
+        }),
+      });
+      if (!r.ok) return null;
+      const j = await r.json();
+      const out = j?.choices?.[0]?.message?.content?.trim();
+      return out || null;
+    } catch { return null; }
+  }
+  async function webTranslate(text){
+    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=en|zh-CN`;
+    const r = await fetch(url); const j = await r.json();
+    return j?.responseData?.translatedText || '';
+  }
+
+  window.doTranslate = async function(){
+    const box = document.getElementById('selectedText');
+    const out = document.getElementById('translation');
+    const text = (box?.value||'').trim(); if (!text) return;
+    let res = '';
+    if (window.localCfg?.preferLocal) res = await localCall(text) || '';
+    if (!res) res = await webTranslate(text);
+    if (out) out.value = res || '';
+    return res;
+  };
+
+  window.doSpeak = function(text){
+    const t = (text || document.getElementById('selectedText')?.value || '').trim();
+    if (!t) return;
+    const u = new SpeechSynthesisUtterance(t); u.lang='en-US';
+    speechSynthesis.cancel(); speechSynthesis.speak(u);
+  };
+
+  // Hook the page buttons to unified handlers
+  document.getElementById('btnTranslate')?.addEventListener('click', e => { e.preventDefault(); window.doTranslate(); });
+  document.getElementById('btnSpeak')?.addEventListener('click', e => { e.preventDefault(); window.doSpeak(); });
+
+});
+</script>
+
+  <script>
+  // Selection Capture
+  (function bindSelectionCapture(){
+    if (window.__SEL_BIND__) return;
+    window.__SEL_BIND__ = true;
+
+    const getTxtBox = () => document.querySelector('#side-panel #selectedText') || document.querySelector('#selectedText');
+
+    function readSelection() {
+      let s = '';
+      try { s = String(window.getSelection?.().toString() || ''); } catch(e){}
+      if (!s.trim()) {
+        const ifr = document.querySelector('iframe#viewerHost');
+        if (ifr && ifr.contentWindow) {
+          try { s = String(ifr.contentWindow.getSelection?.().toString() || ''); } catch(e){}
+        }
+      }
+      return s.replace(/\s+/g, ' ').trim();
+    }
+
+    let t;
+    function scheduleUpdate() {
+      clearTimeout(t);
+      t = setTimeout(() => {
+        const box = getTxtBox();
+        if (!box) return;
+        const text = readSelection();
+        if (text && box.value !== text) {
+          box.value = text;
+          try {
+            if (window.localCfg?.autoTranslate && typeof window.doTranslate === 'function') window.doTranslate();
+            if (window.localCfg?.autoSpeak && typeof window.doSpeak === 'function') window.doSpeak(text);
+          } catch(e){}
+        }
+      }, 80);
+    }
+
+    const viewer = document.querySelector('#viewerContainer') || document;
+    ['mouseup','keyup','selectionchange'].forEach(ev => {
+      document.addEventListener(ev, scheduleUpdate, true);
+      viewer.addEventListener(ev, scheduleUpdate, true);
+    });
+
+    const ifr = document.querySelector('iframe#viewerHost');
+    if (ifr) {
+      ifr.addEventListener('load', () => {
+        try {
+          ['mouseup','keyup','selectionchange'].forEach(ev => {
+            ifr.contentWindow.document.addEventListener(ev, scheduleUpdate, true);
+          });
+        } catch(e){}
+      });
+    }
+  })();
+  </script>
+<style>
+  #cfgMask{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;z-index:2147483600}
+  #cfgDlg{width:min(520px,92vw);background:#fff;border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,.2);padding:20px}
+  #cfgDlg h3{margin:0 0 12px}
+  #cfgDlg .row{display:flex;gap:8px;align-items:center;margin:8px 0}
+  #cfgDlg label{width:100px;color:#666}
+  #cfgDlg input[type="text"]{flex:1;padding:8px;border:1px solid #ddd;border-radius:6px}
+</style>
+<div id="cfgMask" role="dialog" aria-modal="true">
+  <div id="cfgDlg">
+    <h3>Local Translator Settings</h3>
+    <div class="row"><label>Endpoint</label><input id="cfgEndpoint" type="text" placeholder="http://127.0.0.1:1234/v1"></div>
+    <div class="row"><label>Model</label><input id="cfgModel" type="text" placeholder="qwen2.5-7b-instruct"></div>
+    <div class="row"><label></label><label><input id="cfgPreferLocal" type="checkbox"> 优先本地端点</label></div>
+    <div class="row"><label></label><label><input id="cfgAutoTrans" type="checkbox"> 选中自动翻译</label></div>
+    <div class="row"><label></label><label><input id="cfgAutoSpeak" type="checkbox"> 选中自动朗读</label></div>
+    <div class="row" style="justify-content:flex-end;gap:10px">
+      <button id="cfgTest" class="btn">测试</button>
+      <button id="cfgSave" class="btn">保存</button>
+      <button id="cfgClose" class="btn">关闭</button>
+    </div>
+    <div id="cfgMsg" style="color:#666;margin-top:6px"></div>
+  </div>
+</div>
+<script>
+// Helper to tune PDF.js viewer layout for immersive/fullscreen mode
+function tunePdfViewer() {
+  try {
+    const iframe = document.getElementById('viewerHost');
+    if (!iframe || !iframe.contentWindow || !iframe.contentDocument) return;
+    const doc = iframe.contentDocument;
+    // 1. Inject robust CSS for 100% width, left offset 0, hide sidebar, center viewer
+    const styleId = '__tunePdfViewerStyle';
+    let style = doc.getElementById(styleId);
+    if (!style) {
+      style = doc.createElement('style');
+      style.id = styleId;
+      doc.head.appendChild(style);
+    }
+    style.textContent = `
+      /* Make main containers span full width */
+      #outerContainer, #mainContainer, #viewerContainer {
+        position: relative !important;
+        width: 100% !important;
+        left: 0 !important;
+        margin: 0 !important;
+        box-sizing: border-box !important;
+      }
+      /* Hide and neutralize sidebar widths even if PDF.js toggled it */
+      #sidebarContainer { display: none !important; width: 0 !important; }
+      #outerContainer.sidebarOpen #sidebarContainer { display: none !important; width: 0 !important; }
+      #outerContainer.sidebarOpen #mainContainer { left: 0 !important; }
+
+      /* Center pages */
+      #viewer, .pdfViewer .viewer { margin: 0 auto !important; }
+      #viewer .page { margin-left: auto !important; margin-right: auto !important; }
+    `;
+    // 2. Close sidebar if open
+    const sidebar = doc.getElementById('sidebarContainer');
+    const sidebarToggle = doc.getElementById('sidebarToggle');
+    if (sidebar && sidebarToggle) {
+      // Sidebar is visible if not hidden and width > 0
+      const st = doc.defaultView.getComputedStyle(sidebar);
+      if (st.display !== 'none' && st.visibility !== 'hidden' && sidebar.offsetWidth > 30) {
+        sidebarToggle.click();
+      }
+    }
+    // 3. Set scale to 'page-width'
+    if (iframe.contentWindow.PDFViewerApplication && iframe.contentWindow.PDFViewerApplication.pdfViewer) {
+      iframe.contentWindow.PDFViewerApplication.pdfViewer.currentScaleValue = 'page-width';
+    }
+  } catch (e) {
+    // Ignore errors (likely cross-origin or PDF.js not loaded yet)
+  }
+}
+
+(function setupFullscreen() {
+  const btn = document.getElementById('btnFullscreen');
+  if (!btn) { console.warn('[fs] button missing'); return; }
+
+  // 全屏目标：优先 PDF 宿主 iframe，其次 PDF.js 容器，最后整个页面
+  const root = document.documentElement; // 让整个页面进入全屏，右侧栏可见
+
+  const isFs = () => !!(
+    document.fullscreenElement ||
+    document.webkitFullscreenElement ||
+    document.mozFullScreenElement ||
+    document.msFullscreenElement
+  );
+
+  const enter = (el) => (el.requestFullscreen ||
+    el.webkitRequestFullscreen ||
+    el.mozRequestFullScreen ||
+    el.msRequestFullscreen)?.call(el);
+
+  const exit = () => (document.exitFullscreen ||
+    document.webkitExitFullscreen ||
+    document.mozCancelFullScreen ||
+    document.msExitFullscreen)?.call(document);
+
+  btn.addEventListener('click', () => { try { isFs() ? exit() : enter(root); } catch(e){ console.error('[fs]', e); } });
+
+  document.addEventListener('fullscreenchange', () => {
+    document.body.classList.toggle('immersive', !!document.fullscreenElement);
+    tunePdfViewer();
+  });
+
+  // When iframe loads (PDF.js loaded or PDF changed), tune layout
+  const iframe = document.getElementById('viewerHost');
+  if (iframe) {
+    iframe.addEventListener('load', () => {
+      setTimeout(tunePdfViewer, 120); // Wait a bit for PDF.js to render
+    });
+  }
+
+  // Optionally, on resize in immersive mode, retune layout
+  window.addEventListener('resize', () => {
+    if (document.body.classList.contains('immersive')) {
+      tunePdfViewer();
+    }
+  });
+})();
+</script>
+</body>
+</html>
