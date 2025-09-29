@@ -25,10 +25,3 @@
 > `docs/preview-sidepanel.png`
 
 ## 本地运行
-
-```bash
-# 任意静态服务均可，这里举例 node http-server
-npm i -g http-server
-http-server -p 5173
-# 浏览器打开 http://127.0.0.1:5173# pdf-study-reader
-轻量级沉浸式 PDF 学习阅读器：选中即译/即读，本地大模型优先，内置生词本，零后端，纯前端可部署
